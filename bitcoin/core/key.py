@@ -15,6 +15,7 @@ import ctypes
 import ctypes.util
 import hashlib
 import sys
+import bitcoin.core.script
 
 ssl = ctypes.cdll.LoadLibrary(ctypes.util.find_library ('ssl') or 'libeay32')
 
@@ -30,6 +31,10 @@ def _check_result (val, func, args):
 
 ssl.EC_KEY_new_by_curve_name.restype = ctypes.c_void_p
 ssl.EC_KEY_new_by_curve_name.errcheck = _check_result
+
+# From openssl/ecdsa.h
+class ECDSA_SIG_st(ctypes.Structure):
+    _fields_ = [("r", ctypes.c_void_p), ("s", ctypes.c_void_p)]
 
 class CECKey:
     """Wrapper around OpenSSL's EC_KEY"""
@@ -99,7 +104,40 @@ class CECKey:
         mb_sig = ctypes.create_string_buffer(sig_size0.value)
         result = ssl.ECDSA_sign(0, hash, len(hash), mb_sig, ctypes.byref(sig_size0), self.k)
         assert 1 == result
-        return mb_sig.raw[:sig_size0.value]
+        if bitcoin.core.script.IsLowDERSignature(mb_sig.raw[:sig_size0.value]):
+            return mb_sig.raw[:sig_size0.value]
+        else:
+            return self.signature_to_low_s(mb_sig.raw[:sig_size0.value])
+
+    def signature_to_low_s(self, sig):
+        der_sig = ECDSA_SIG_st()
+        ssl.d2i_ECDSA_SIG(ctypes.byref(ctypes.pointer(der_sig)), ctypes.byref(ctypes.c_char_p(sig)), len(sig))
+        group = ssl.EC_KEY_get0_group(self.k)
+        order = ssl.BN_new()
+        halforder = ssl.BN_new()
+        ctx = ssl.BN_CTX_new()
+        ssl.EC_GROUP_get_order(group, order, ctx)
+        ssl.BN_rshift1(halforder, order)
+
+        # Verify that s is over half the order of the curve before we actually subtract anything from it
+        if ssl.BN_cmp(der_sig.s, halforder) > 0:
+          ssl.BN_sub(der_sig.s, order, der_sig.s)
+
+        ssl.BN_free(halforder)
+        ssl.BN_free(order)
+        ssl.BN_CTX_free(ctx)
+
+        derlen = ssl.i2d_ECDSA_SIG(ctypes.pointer(der_sig), 0)
+        if derlen == 0:
+            ssl.ECDSA_SIG_free(der_sig)
+            return None
+
+        new_sig = ctypes.create_string_buffer(derlen)
+        ssl.i2d_ECDSA_SIG(ctypes.pointer(der_sig), ctypes.byref(ctypes.pointer(new_sig)))
+        ssl.BN_free(der_sig.r)
+        ssl.BN_free(der_sig.s)
+
+        return new_sig.raw
 
     def verify(self, hash, sig):
         """Verify a DER signature"""
